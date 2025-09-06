@@ -176,7 +176,7 @@ class ScrapeableApiModel(CacheableModel):
         *,
         use_cache: bool | str,
         raise_on_status_except_for: Sequence[int] | None = None,
-    ) -> list[Self]:
+    ) -> Sequence[Self]:
         """Return model instances from the list endpoint or cache.
 
         Merges fresh list results with cached items by ``cache_key`` and removes
