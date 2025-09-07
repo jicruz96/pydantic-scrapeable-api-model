@@ -6,7 +6,11 @@ from typing import Any
 
 from pydantic_cacheable_model import CacheKey
 
-from pydantic_scrapeable_api_model import ScrapeableApiModel, ScrapeableField
+from pydantic_scrapeable_api_model import (
+    ScrapeableApiModel,
+    DetailField,
+    CustomScrapeField,
+)
 
 
 class JSONPlaceholderAPIScraper(ScrapeableApiModel):
@@ -27,13 +31,13 @@ class Post(JSONPlaceholderAPIScraper):
     userId: int
     title: str
     body: str
-    comments_count: ScrapeableField[int]
+    comments_count: DetailField[int] = CustomScrapeField("fetch_comments_count")
 
     @property
     def detail_endpoint(self) -> str:
         return f"/posts/{self.id}"
 
-    async def scrape_comments_count(self) -> None:
+    async def fetch_comments_count(self) -> None:
         resp = await self.request(
             id=f"post-{self.id}-comments",
             url=self._build_url(f"/posts/{self.id}/comments"),
@@ -56,13 +60,13 @@ class Todo(JSONPlaceholderAPIScraper):
     userId: int
     title: str
     completed: bool
-    title_length: ScrapeableField[int]
+    title_length: DetailField[int] = CustomScrapeField("compute_title_length")
 
     @property
     def cache_key(self) -> str:
         return str(self.id)
 
-    async def scrape_title_length(self) -> None:
+    async def compute_title_length(self) -> None:
         # Demonstrates a non-HTTP field getter
         self.title_length = len(self.title)
 

@@ -33,13 +33,14 @@ T = TypeVar("T")
 
 __all__ = [
     "ScrapeableApiModel",
-    "ScrapeableField",
-    "UnscrapedType",
+    "DetailField",
+    "CustomScrapeField",
+    "UnscrapedDetailFieldType",
     "CacheKey",
 ]
 
 
-class UnscrapedType(BaseModel):
+class UnscrapedDetailFieldType(BaseModel):
     def __bool__(self) -> bool:
         return False
 
@@ -47,7 +48,31 @@ class UnscrapedType(BaseModel):
         return 0
 
 
-ScrapeableField = Annotated[T | UnscrapedType, Field(default_factory=UnscrapedType)]
+# Fields annotated with ``DetailField`` start as ``UnscrapedDetailFieldType``
+# placeholders and are filled only after ``scrape_detail`` or a custom getter runs.
+DetailField = Annotated[
+    T | UnscrapedDetailFieldType, Field(default_factory=UnscrapedDetailFieldType)
+]
+
+
+def CustomScrapeField(method_name: str, **kwargs: Any) -> Any:
+    """Field wrapper for values scraped by a custom instance method.
+
+    Args:
+        method_name: Name of the coroutine method on the instance that
+            populates this field.
+        **kwargs: Additional ``Field`` keyword arguments.
+
+    Returns:
+        A ``Field`` configured with an ``UnscrapedDetailFieldType`` placeholder and
+        metadata pointing to the custom scraper method.
+    """
+
+    return Field(
+        default_factory=UnscrapedDetailFieldType,
+        json_schema_extra={"scrape_method": method_name},
+        **kwargs,
+    )
 
 _error_log_lock: asyncio.Lock | None = None
 
@@ -78,7 +103,9 @@ class ScrapeableApiModel(CacheableModel):
 
     def unscraped_fields(self) -> list[str]:
         """Return names of fields that are still placeholders (unscraped)."""
-        return [field for field, value in self if isinstance(value, UnscrapedType)]
+        return [
+            field for field, value in self if isinstance(value, UnscrapedDetailFieldType)
+        ]
 
     @classmethod
     def _iter_all_subclasses(cls) -> list[type["ScrapeableApiModel"]]:
@@ -107,21 +134,32 @@ class ScrapeableApiModel(CacheableModel):
 
     @classmethod
     async def run(
-        cls, *, set_client: SetClient | None = None, use_cache: bool, check_api: bool
+        cls,
+        *,
+        set_client: SetClient | None = None,
+        use_cache: bool,
+        check_api: bool,
+        scrape_details: bool = True,
     ) -> None:
         """Run all discovered subclass scrapers concurrently.
 
         Manages the HTTP client lifespan, discovers all subclasses recursively,
-        and executes ``scrape_all`` for each class that defines ``list_endpoint``.
+        and executes ``scrape_list`` for each class that defines ``list_endpoint``.
 
         Args:
             set_client: Optional factory to create a custom ``httpx.AsyncClient``.
             use_cache: Whether to read/write cache during scraping.
             check_api: When ``False``, skip network and only use cached data.
+            scrape_details: If ``True`` (default), also scrape the detail endpoint for
+                each item returned by ``scrape_list``.
         """
         async with lifespan(set_client=set_client):
             tasks = [
-                subclass.scrape_all(check_api=check_api, use_cache=use_cache)
+                subclass.scrape_list(
+                    check_api=check_api,
+                    use_cache=use_cache,
+                    scrape_details=scrape_details,
+                )
                 for subclass in cls._iter_all_subclasses()
                 if subclass.list_endpoint
             ]
@@ -130,25 +168,6 @@ class ScrapeableApiModel(CacheableModel):
             )
             if tasks:
                 await asyncio.gather(*tasks)
-
-    @classmethod
-    async def scrape_all(
-        cls,
-        check_api: bool | str = True,
-        *,
-        use_cache: bool = True,
-    ) -> None:
-        """Scrape the list endpoint and then details for each item.
-
-        Args:
-            check_api: ``True`` uses the class ``list_endpoint``; ``False`` uses
-                only cache; a string overrides the endpoint URL/path.
-            use_cache: Whether to load/store items from/to cache.
-        """
-        items = await cls.scrape_list(check_api=check_api, use_cache=use_cache)
-        await asyncio.gather(
-            *(item.scrape_detail(use_cache=use_cache) for item in items)
-        )
 
     @classmethod
     def response_to_models(cls, resp: httpx.Response) -> Sequence[Self]:
@@ -174,18 +193,22 @@ class ScrapeableApiModel(CacheableModel):
         cls,
         check_api: bool | str,
         *,
-        use_cache: bool | str,
+        use_cache: bool,
+        scrape_details: bool = True,
         raise_on_status_except_for: Sequence[int] | None = None,
     ) -> Sequence[Self]:
         """Return model instances from the list endpoint or cache.
 
-        Merges fresh list results with cached items by ``cache_key`` and removes
-        stale cache entries when a class ``list_endpoint`` is defined.
+        Optionally performs detail scraping for each model. Merges fresh list
+        results with cached items by ``cache_key`` and removes stale cache
+        entries when a class ``list_endpoint`` is defined.
 
         Args:
             check_api: ``True`` to use ``list_endpoint``; ``False`` to skip API;
                 a string to override the endpoint.
             use_cache: ``True`` to read/write cache; ``False`` to ignore cache.
+        scrape_details: When ``True`` (default), invoke ``scrape_detail`` on each
+            model before returning.
             raise_on_status_except_for: Status codes that should not raise.
 
         Returns:
@@ -228,6 +251,11 @@ class ScrapeableApiModel(CacheableModel):
 
         for model in models:
             model.cache()
+
+        if scrape_details:
+            await asyncio.gather(
+                *(m.scrape_detail(use_cache=use_cache) for m in models)
+            )
 
         if cls.list_endpoint:
             existing_cache_files = set(
@@ -311,8 +339,8 @@ class ScrapeableApiModel(CacheableModel):
         """Populate remaining fields via cache, field getters, and detail API.
 
         1) Merge fields from a cached instance when available and allowed.
-        2) Invoke any ``scrape_<field>()`` coroutine getters for fields still in
-           ``UnscrapedType`` state.
+        2) Invoke any custom scraper methods declared via ``CustomScrapeField``
+           for fields still in ``UnscrapedDetailFieldType`` state.
         3) If fields remain and ``detail_endpoint`` is provided, perform a GET
            and update attributes from the JSON response body.
         4) Cache the result.
@@ -327,7 +355,11 @@ class ScrapeableApiModel(CacheableModel):
                 if field in self.unscraped_fields():
                     setattr(self, field, val)
         for field in self.unscraped_fields():
-            if getter := getattr(self, f"scrape_{field}", None):
+            field_info = type(self).model_fields[field]
+            scrape_method = (
+                (field_info.json_schema_extra or {}).get("scrape_method")
+            )
+            if scrape_method and (getter := getattr(self, scrape_method, None)):
                 await getter()
         self.cache()
         if (
