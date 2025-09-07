@@ -24,6 +24,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from ji_async_http_utils.httpx import SetClient, lifespan, request
 from pydantic import BaseModel, Field
+from pydantic.fields import FieldInfo
 from pydantic.main import IncEx
 from pydantic_cacheable_model import CacheableModel, CacheKey
 
@@ -77,6 +78,16 @@ def CustomScrapeField(method_name: str, **kwargs: Any) -> Any:
         **kwargs,
     )
 
+
+def _get_scrape_method(field: FieldInfo) -> str | None:
+    """Return the custom scrape method name for a field, if any."""
+    extra = field.json_schema_extra
+    if isinstance(extra, dict):
+        method = extra.get("scrape_method")
+        if isinstance(method, str):
+            return method
+    return None
+
 _error_log_lock: asyncio.Lock | None = None
 
 
@@ -105,8 +116,7 @@ class ScrapeableApiModel(CacheableModel):
         super().__init_subclass__(**kwargs)
 
         for field_name, field in cls.model_fields.items():
-            extra = field.json_schema_extra or {}
-            method_name = extra.get("scrape_method")
+            method_name = _get_scrape_method(field)
             if not method_name:
                 continue
 
@@ -122,17 +132,16 @@ class ScrapeableApiModel(CacheableModel):
 
             expected_type = field.annotation
             args = [a for a in get_args(expected_type) if a is not UnscrapedDetailFieldType]
-            if args:
-                expected_type = args[0]
+            allowed_types = tuple(args) if args else (expected_type,)
 
             return_type = get_type_hints(method).get("return")
             if return_type is None:
                 raise TypeError(
                     f"Custom scraper '{method_name}' for field '{field_name}' must declare a return type"
                 )
-            if return_type != expected_type:
+            if return_type not in allowed_types:
                 raise TypeError(
-                    f"Custom scraper '{method_name}' for field '{field_name}' returns {return_type}, expected {expected_type}"
+                    f"Custom scraper '{method_name}' for field '{field_name}' returns {return_type}, expected one of {allowed_types}"
                 )
 
     def unscraped_fields(self) -> list[str]:
@@ -390,9 +399,9 @@ class ScrapeableApiModel(CacheableModel):
                     setattr(self, field, val)
         for field in self.unscraped_fields():
             field_info = type(self).model_fields[field]
-            scrape_method = (field_info.json_schema_extra or {}).get("scrape_method")
-            if scrape_method:
-                getter = getattr(self, scrape_method)
+            method_name = _get_scrape_method(field_info)
+            if method_name:
+                getter = getattr(self, method_name)
                 setattr(self, field, await getter())
         self.cache()
         if (
