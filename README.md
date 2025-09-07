@@ -20,7 +20,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from pydantic_scrapeable_api_model import CacheKey, ScrapeableApiModel, ScrapeableField
+from pydantic_scrapeable_api_model import (
+    CacheKey,
+    ScrapeableApiModel,
+    DetailField,
+    CustomScrapeField,
+)
 
 
 class MyAPI(ScrapeableApiModel):
@@ -29,27 +34,28 @@ class MyAPI(ScrapeableApiModel):
 
     id: CacheKey[int]  # required, unique key (or create a custom `id` property)
     name: str
-    # lazily-scraped field (filled by `scrape_detail` or a custom getter)
-    description: ScrapeableField[str]
+    # lazily-scraped field (filled by `scrape_detail` or a custom method)
+    description: DetailField[str] = CustomScrapeField("fetch_description")
 
     @property
     def detail_endpoint(self) -> str | None:
         return f"/items/{self.id}"
 
     # Optional: fetch a field yourself instead of relying on detail_endpoint
-    async def scrape_description(self) -> None:
+    async def fetch_description(self) -> str:
         resp = await self.request(
             id=f"item-{self.id}-desc",
             url=self._build_url(f"/items/{self.id}/description"),
             headers={"Accept": "application/json"},
         )
-        if resp:
-            self.description = resp.json()["description"]
+        if not resp:
+            return ""
+        return resp.json()["description"]
 
 
 async def main() -> None:
     # Scrape list + detail for all models of MyAPI
-    await MyAPI.scrape_all(check_api=True, use_cache=True)
+    await MyAPI.scrape_list(check_api=True, use_cache=True)
 
     # Work with cached data later
     items = list(MyAPI.load_all_cached())
@@ -59,6 +65,13 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+Fields annotated with `DetailField` begin as placeholders and are populated
+only after `scrape_detail` runs (via `.scrape_list()` by default, `.scrape_detail()`, or a
+custom getter). Pass `scrape_details=False` to `scrape_list` to skip detail scraping. Use
+`CustomScrapeField("method_name")` to register an async method that returns the
+field's value during `scrape_detail`. These methods are validated to exist and to
+return the same type as the field they populate.
 
 ### Run All Subclasses
 
@@ -98,7 +111,7 @@ class ExternalFeed(ScrapeableApiModel):
     title: str
 
 # Works because the endpoint is absolute
-asyncio.run(ExternalFeed.scrape_all(check_api=True, use_cache=True))
+asyncio.run(ExternalFeed.scrape_list(check_api=True, use_cache=True, scrape_details=False))
 ```
 
 ### Cached Access Helpers
@@ -147,8 +160,7 @@ class MyWrappedAPI(MyAPI):
 ## API Notes
 
 ```python
-MyModel.scrape_list(check_api=True|False|"/override") -> list[MyModel]
-MyModel.scrape_all(check_api=True, use_cache=True) -> None
+MyModel.scrape_list(check_api=True|False|"/override", use_cache=True|False, scrape_details=True|False) -> list[MyModel]
 MyModel.run(use_cache=True, check_api=True) -> None  # runs all subclasses
 MyModel.get(cache_key=..., check_api=False) -> Optional[MyModel]
 MyModel.load_all_cached() -> Iterable[MyModel]
