@@ -37,7 +37,7 @@ class Post(JSONPlaceholderAPIScraper):
     def detail_endpoint(self) -> str:
         return f"/posts/{self.id}"
 
-    async def fetch_comments_count(self) -> None:
+    async def fetch_comments_count(self) -> int:
         resp = await self.request(
             id=f"post-{self.id}-comments",
             url=self._build_url(f"/posts/{self.id}/comments"),
@@ -45,10 +45,9 @@ class Post(JSONPlaceholderAPIScraper):
         )
         if resp is None:
             # Mark as known-empty to avoid repeated attempts this run
-            self.comments_count = 0
-        else:
-            data: list[dict[str, Any]] = resp.json()
-            self.comments_count = len(data)
+            return 0
+        data: list[dict[str, Any]] = resp.json()
+        return len(data)
 
 
 class Todo(JSONPlaceholderAPIScraper):
@@ -66,9 +65,9 @@ class Todo(JSONPlaceholderAPIScraper):
     def cache_key(self) -> str:
         return str(self.id)
 
-    async def compute_title_length(self) -> None:
+    async def compute_title_length(self) -> int:
         # Demonstrates a non-HTTP field getter
-        self.title_length = len(self.title)
+        return len(self.title)
 
 
 async def main() -> None:

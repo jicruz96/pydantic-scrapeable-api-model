@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ from typing import (
     Literal,
     Sequence,
     TypeVar,
+    get_args,
+    get_type_hints,
 )
 from urllib.parse import urljoin, urlparse
 
@@ -96,10 +99,41 @@ class ScrapeableApiModel(CacheableModel):
         """Validate subclass configuration when defined.
 
         Ensures a non-empty ``BASE_URL`` is set so relative endpoints can be
-        joined correctly.
+        joined correctly and validates any ``CustomScrapeField`` definitions.
         """
         assert bool(cls.BASE_URL)  # enforce existence of a url
         super().__init_subclass__(**kwargs)
+
+        for field_name, field in cls.model_fields.items():
+            extra = field.json_schema_extra or {}
+            method_name = extra.get("scrape_method")
+            if not method_name:
+                continue
+
+            method = getattr(cls, method_name, None)
+            if method is None:
+                raise AttributeError(
+                    f"{cls.__name__}.{field_name} references unknown method '{method_name}'"
+                )
+            if not inspect.iscoroutinefunction(method):
+                raise TypeError(
+                    f"Custom scraper '{method_name}' for field '{field_name}' must be async"
+                )
+
+            expected_type = field.annotation
+            args = [a for a in get_args(expected_type) if a is not UnscrapedDetailFieldType]
+            if args:
+                expected_type = args[0]
+
+            return_type = get_type_hints(method).get("return")
+            if return_type is None:
+                raise TypeError(
+                    f"Custom scraper '{method_name}' for field '{field_name}' must declare a return type"
+                )
+            if return_type != expected_type:
+                raise TypeError(
+                    f"Custom scraper '{method_name}' for field '{field_name}' returns {return_type}, expected {expected_type}"
+                )
 
     def unscraped_fields(self) -> list[str]:
         """Return names of fields that are still placeholders (unscraped)."""
@@ -356,11 +390,10 @@ class ScrapeableApiModel(CacheableModel):
                     setattr(self, field, val)
         for field in self.unscraped_fields():
             field_info = type(self).model_fields[field]
-            scrape_method = (
-                (field_info.json_schema_extra or {}).get("scrape_method")
-            )
-            if scrape_method and (getter := getattr(self, scrape_method, None)):
-                await getter()
+            scrape_method = (field_info.json_schema_extra or {}).get("scrape_method")
+            if scrape_method:
+                getter = getattr(self, scrape_method)
+                setattr(self, field, await getter())
         self.cache()
         if (
             self.unscraped_fields()

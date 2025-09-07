@@ -42,14 +42,15 @@ class MyAPI(ScrapeableApiModel):
         return f"/items/{self.id}"
 
     # Optional: fetch a field yourself instead of relying on detail_endpoint
-    async def fetch_description(self) -> None:
+    async def fetch_description(self) -> str:
         resp = await self.request(
             id=f"item-{self.id}-desc",
             url=self._build_url(f"/items/{self.id}/description"),
             headers={"Accept": "application/json"},
         )
-        if resp:
-            self.description = resp.json()["description"]
+        if not resp:
+            return ""
+        return resp.json()["description"]
 
 
 async def main() -> None:
@@ -68,8 +69,9 @@ asyncio.run(main())
 Fields annotated with `DetailField` begin as placeholders and are populated
 only after `scrape_detail` runs (via `.scrape_list()` by default, `.scrape_detail()`, or a
 custom getter). Pass `scrape_details=False` to `scrape_list` to skip detail scraping. Use
-`CustomScrapeField("method_name")` to register a custom
-method that fills a field during `scrape_detail`.
+`CustomScrapeField("method_name")` to register an async method that returns the
+field's value during `scrape_detail`. These methods are validated to exist and to
+return the same type as the field they populate.
 
 ### Run All Subclasses
 
