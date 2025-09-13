@@ -1,6 +1,6 @@
 [project]
 name = "pydantic-scrapeable-api-model"
-version = "1.0.0"
+version = "2.0.0"
 description = "Minimal utilities to build scrapeable API models on top of Pydantic with simple caching and async HTTP."
 readme = "README.md"
 authors = [
