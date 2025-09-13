@@ -107,20 +107,15 @@ class ScrapeableApiModel(CacheableModel):
         """
         return None
 
-    def __init_subclass__(cls, **kwargs: Any):
-        """Validate subclass configuration when defined.
-
-        Ensures a non-empty ``BASE_URL`` is set so relative endpoints can be
-        joined correctly and validates any ``CustomScrapeField`` definitions.
-        """
-        assert bool(cls.BASE_URL)  # enforce existence of a url
-        super().__init_subclass__(**kwargs)
-
+    @classmethod
+    def get_custom_scrape_methods(
+        cls,
+    ) -> dict[str, Callable[..., Any]]:
+        scrape_methods = dict[str, Callable[..., Any]]()
         for field_name, field in cls.model_fields.items():
             method_name = _get_scrape_method(field)
             if not method_name:
                 continue
-
             method = getattr(cls, method_name, None)
             if method is None:
                 raise AttributeError(
@@ -130,6 +125,42 @@ class ScrapeableApiModel(CacheableModel):
                 raise TypeError(
                     f"Custom scraper '{method_name}' for field '{field_name}' must be async"
                 )
+
+            # Validate method signature: allow (self) or (self, session: aiohttp.ClientSession)
+            sig = inspect.signature(method)
+            params = list(sig.parameters.values())
+            if not params or params[0].name != "self":
+                raise TypeError(
+                    f"Custom scraper '{method_name}' for field '{field_name}' must be an instance method with first parameter 'self'"
+                )
+            extra_params = params[1:]
+            if any(
+                p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for p in extra_params
+            ):
+                raise TypeError(
+                    f"Custom scraper '{method_name}' for field '{field_name}' must not use *args/**kwargs"
+                )
+            if len(extra_params) > 1:
+                raise TypeError(
+                    f"Custom scraper '{method_name}' for field '{field_name}' may have at most one extra parameter 'session'"
+                )
+            if extra_params:
+                session_param = extra_params[0]
+                if session_param.name != "session":
+                    raise TypeError(
+                        f"Custom scraper '{method_name}' for field '{field_name}' second parameter must be named 'session'"
+                    )
+                hints = get_type_hints(method)
+                session_type = hints.get("session")
+                if session_type is None:
+                    raise TypeError(
+                        f"Custom scraper '{method_name}' for field '{field_name}' must type-annotate 'session: aiohttp.ClientSession'"
+                    )
+                if session_type is not aiohttp.ClientSession:
+                    raise TypeError(
+                        f"Custom scraper '{method_name}' for field '{field_name}' 'session' parameter must be of type aiohttp.ClientSession"
+                    )
 
             expected_type = field.annotation
             args = [
@@ -146,6 +177,19 @@ class ScrapeableApiModel(CacheableModel):
                 raise TypeError(
                     f"Custom scraper '{method_name}' for field '{field_name}' returns {return_type}, expected one of {allowed_types}"
                 )
+
+            scrape_methods[field_name] = method
+        return scrape_methods
+
+    def __init_subclass__(cls, **kwargs: Any):
+        """Validate subclass configuration when defined.
+
+        Ensures a non-empty ``BASE_URL`` is set so relative endpoints can be
+        joined correctly and validates any ``CustomScrapeField`` definitions.
+        """
+        assert bool(cls.BASE_URL)  # enforce existence of a url
+        super().__init_subclass__(**kwargs)
+        cls.get_custom_scrape_methods()
 
     def unscraped_fields(self) -> list[str]:
         """Return names of fields that are still placeholders (unscraped)."""
@@ -422,12 +466,16 @@ class ScrapeableApiModel(CacheableModel):
             for field, val in existing:
                 if field in self.unscraped_fields():
                     setattr(self, field, val)
-        for field in self.unscraped_fields():
-            field_info = type(self).model_fields[field]
-            method_name = _get_scrape_method(field_info)
-            if method_name:
-                getter = getattr(self, method_name)
-                setattr(self, field, await getter())
+        for field, getter in self.get_custom_scrape_methods().items():
+            bound = getter.__get__(self, self.__class__)
+            # Decide whether to pass session based on declared parameters
+            sig = inspect.signature(getter)
+            param_names = [p.name for p in sig.parameters.values()]
+            if len(param_names) >= 2 and param_names[1] == "session":
+                value = await bound(session)
+            else:
+                value = await bound()
+            setattr(self, field, value)
         self.cache()
         if (
             self.unscraped_fields()

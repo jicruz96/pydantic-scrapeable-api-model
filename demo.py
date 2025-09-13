@@ -38,18 +38,17 @@ class Post(JSONPlaceholderAPIScraper):
     def detail_endpoint(self) -> str:
         return f"/posts/{self.id}"
 
-    async def fetch_comments_count(self) -> int:
-        async with aiohttp.ClientSession() as session:
-            resp = await self.request(
-                id=f"post-{self.id}-comments",
-                url=self._build_url(f"/posts/{self.id}/comments"),
-                headers={"Accept": "application/json"},
-                session=session,
-            )
-            if resp is None:
-                # Mark as known-empty to avoid repeated attempts this run
-                return 0
-            data: list[dict[str, Any]] = await resp.json()
+    async def fetch_comments_count(self, session: aiohttp.ClientSession) -> int:
+        resp = await self.request(
+            id=f"post-{self.id}-comments",
+            url=self._build_url(f"/posts/{self.id}/comments"),
+            headers={"Accept": "application/json"},
+            session=session,
+        )
+        if resp is None:
+            # Mark as known-empty to avoid repeated attempts this run
+            return 0
+        data: list[dict[str, Any]] = await resp.json()
         return len(data)
 
 
