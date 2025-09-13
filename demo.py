@@ -4,12 +4,13 @@ import argparse
 import asyncio
 from typing import Any
 
+import aiohttp
 from pydantic_cacheable_model import CacheKey
 
 from pydantic_scrapeable_api_model import (
-    ScrapeableApiModel,
-    DetailField,
     CustomScrapeField,
+    DetailField,
+    ScrapeableApiModel,
 )
 
 
@@ -38,15 +39,17 @@ class Post(JSONPlaceholderAPIScraper):
         return f"/posts/{self.id}"
 
     async def fetch_comments_count(self) -> int:
-        resp = await self.request(
-            id=f"post-{self.id}-comments",
-            url=self._build_url(f"/posts/{self.id}/comments"),
-            headers={"Accept": "application/json"},
-        )
-        if resp is None:
-            # Mark as known-empty to avoid repeated attempts this run
-            return 0
-        data: list[dict[str, Any]] = resp.json()
+        async with aiohttp.ClientSession() as session:
+            resp = await self.request(
+                id=f"post-{self.id}-comments",
+                url=self._build_url(f"/posts/{self.id}/comments"),
+                headers={"Accept": "application/json"},
+                session=session,
+            )
+            if resp is None:
+                # Mark as known-empty to avoid repeated attempts this run
+                return 0
+            data: list[dict[str, Any]] = await resp.json()
         return len(data)
 
 

@@ -21,8 +21,8 @@ from typing import (
 )
 from urllib.parse import urljoin, urlparse
 
-import httpx
-from ji_async_http_utils.httpx import SetClient, lifespan, request
+import aiohttp
+import ji_async_http_utils.aiohttp
 from pydantic import BaseModel, Field
 from pydantic.fields import FieldInfo
 from pydantic.main import IncEx
@@ -83,10 +83,11 @@ def _get_scrape_method(field: FieldInfo) -> str | None:
     """Return the custom scrape method name for a field, if any."""
     extra = field.json_schema_extra
     if isinstance(extra, dict):
-        method = extra.get("scrape_method")
+        method = extra.get("scrape_method")  # type: ignore
         if isinstance(method, str):
             return method
     return None
+
 
 _error_log_lock: asyncio.Lock | None = None
 
@@ -131,7 +132,9 @@ class ScrapeableApiModel(CacheableModel):
                 )
 
             expected_type = field.annotation
-            args = [a for a in get_args(expected_type) if a is not UnscrapedDetailFieldType]
+            args = [
+                a for a in get_args(expected_type) if a is not UnscrapedDetailFieldType
+            ]
             allowed_types = tuple(args) if args else (expected_type,)
 
             return_type = get_type_hints(method).get("return")
@@ -147,7 +150,9 @@ class ScrapeableApiModel(CacheableModel):
     def unscraped_fields(self) -> list[str]:
         """Return names of fields that are still placeholders (unscraped)."""
         return [
-            field for field, value in self if isinstance(value, UnscrapedDetailFieldType)
+            field
+            for field, value in self
+            if isinstance(value, UnscrapedDetailFieldType)
         ]
 
     @classmethod
@@ -179,29 +184,29 @@ class ScrapeableApiModel(CacheableModel):
     async def run(
         cls,
         *,
-        set_client: SetClient | None = None,
         use_cache: bool,
         check_api: bool,
         scrape_details: bool = True,
     ) -> None:
         """Run all discovered subclass scrapers concurrently.
 
-        Manages the HTTP client lifespan, discovers all subclasses recursively,
-        and executes ``scrape_list`` for each class that defines ``list_endpoint``.
+        Manages a single ``aiohttp.ClientSession`` lifespan, discovers all
+        subclasses recursively, and executes ``scrape_list`` for each class
+        that defines ``list_endpoint``.
 
         Args:
-            set_client: Optional factory to create a custom ``httpx.AsyncClient``.
             use_cache: Whether to read/write cache during scraping.
             check_api: When ``False``, skip network and only use cached data.
             scrape_details: If ``True`` (default), also scrape the detail endpoint for
                 each item returned by ``scrape_list``.
         """
-        async with lifespan(set_client=set_client):
+        async with aiohttp.ClientSession() as session:
             tasks = [
                 subclass.scrape_list(
                     check_api=check_api,
                     use_cache=use_cache,
                     scrape_details=scrape_details,
+                    session=session,
                 )
                 for subclass in cls._iter_all_subclasses()
                 if subclass.list_endpoint
@@ -213,7 +218,9 @@ class ScrapeableApiModel(CacheableModel):
                 await asyncio.gather(*tasks)
 
     @classmethod
-    def response_to_models(cls, resp: httpx.Response) -> Sequence[Self]:
+    async def process_list_response(
+        cls, resp: aiohttp.ClientResponse
+    ) -> Sequence[Self]:
         """Map an HTTP response to model instances.
 
         Override in subclasses to adapt to non-trivial response shapes
@@ -221,15 +228,25 @@ class ScrapeableApiModel(CacheableModel):
         expects a JSON array of objects directly parseable into ``cls``.
 
         Args:
-            resp: The successful ``httpx.Response`` object.
+            resp: The successful ``aiohttp.ClientResponse`` object.
 
         Returns:
             A sequence of instantiated models.
         """
-        return [cls(**i) for i in resp.json()]
+        return [cls(**i) for i in (await resp.json())]
 
-    # Backwards-compat alias
-    _response_to_models = response_to_models
+    async def process_detail_response(self, resp: aiohttp.ClientResponse) -> None:
+        """Populate this instance from a detail response.
+
+        Override in subclasses to adapt to non-trivial response shapes
+        (e.g., nested keys). The default implementation expects a JSON object
+        and sets attributes from the top-level keys.
+
+        Args:
+            resp: The successful ``aiohttp.ClientResponse`` object.
+        """
+        for field, value in (await resp.json()).items():
+            setattr(self, field, value)
 
     @classmethod
     async def scrape_list(
@@ -238,6 +255,7 @@ class ScrapeableApiModel(CacheableModel):
         *,
         use_cache: bool,
         scrape_details: bool = True,
+        session: aiohttp.ClientSession,
         raise_on_status_except_for: Sequence[int] | None = None,
     ) -> Sequence[Self]:
         """Return model instances from the list endpoint or cache.
@@ -250,8 +268,9 @@ class ScrapeableApiModel(CacheableModel):
             check_api: ``True`` to use ``list_endpoint``; ``False`` to skip API;
                 a string to override the endpoint.
             use_cache: ``True`` to read/write cache; ``False`` to ignore cache.
-        scrape_details: When ``True`` (default), invoke ``scrape_detail`` on each
-            model before returning.
+            scrape_details: When ``True`` (default), invoke ``scrape_detail`` on each
+                model before returning.
+            session: The ``aiohttp.ClientSession`` to use for HTTP requests.
             raise_on_status_except_for: Status codes that should not raise.
 
         Returns:
@@ -279,6 +298,7 @@ class ScrapeableApiModel(CacheableModel):
             url=url,
             headers={"Accept": "application/json"},
             raise_on_status_except_for=raise_on_status_except_for,
+            session=session,
         )
         if resp is None:
             cls.logger.warning(
@@ -289,7 +309,8 @@ class ScrapeableApiModel(CacheableModel):
             return list(existing.values())
 
         models = [
-            existing.get(item.cache_key, item) for item in cls.response_to_models(resp)
+            existing.get(item.cache_key, item)
+            for item in await cls.process_list_response(resp)
         ]
 
         for model in models:
@@ -297,7 +318,7 @@ class ScrapeableApiModel(CacheableModel):
 
         if scrape_details:
             await asyncio.gather(
-                *(m.scrape_detail(use_cache=use_cache) for m in models)
+                *(m.scrape_detail(use_cache=use_cache, session=session) for m in models)
             )
 
         if cls.list_endpoint:
@@ -335,7 +356,8 @@ class ScrapeableApiModel(CacheableModel):
         """
         obj = cls.load(cache_key=cache_key)
         if not obj and check_api:
-            await cls.scrape_list(check_api=True, use_cache=True)  # hack
+            async with aiohttp.ClientSession() as session:
+                await cls.scrape_list(check_api=True, use_cache=True, session=session)
             obj = cls.load(cache_key=cache_key)
         if not obj and not not_found_ok:
             raise ValueError(f"Could not find {cls.__name__}({cache_key})")
@@ -378,7 +400,9 @@ class ScrapeableApiModel(CacheableModel):
             if k not in self.unscraped_fields()
         }
 
-    async def scrape_detail(self, *, use_cache: bool = True) -> None:
+    async def scrape_detail(
+        self, *, use_cache: bool = True, session: aiohttp.ClientSession
+    ) -> None:
         """Populate remaining fields via cache, field getters, and detail API.
 
         1) Merge fields from a cached instance when available and allowed.
@@ -390,6 +414,7 @@ class ScrapeableApiModel(CacheableModel):
 
         Args:
             use_cache: Whether to read/write cache during processing.
+            session: The ``aiohttp.ClientSession`` used for any detail request.
         """
         if use_cache and (
             existing := await self.get(cache_key=self.cache_key, not_found_ok=True)
@@ -413,11 +438,11 @@ class ScrapeableApiModel(CacheableModel):
                     url=self._build_url(self.detail_endpoint),
                     headers={"Accept": "application/json"},
                     raise_on_status_except_for=[400, 404, 500],
+                    session=session,
                 )
             )
         ):
-            for field, value in response.json().items():
-                setattr(self, field, value)
+            await self.process_detail_response(response)
             self.cache()
 
     @classmethod
@@ -450,39 +475,44 @@ class ScrapeableApiModel(CacheableModel):
         *,
         id: str,
         url: str,
+        session: aiohttp.ClientSession,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
         raise_on_status_except_for: Sequence[int] | None = None,
-    ) -> httpx.Response | None:
-        """HTTP request wrapper that returns ``None`` on non-success.
+    ) -> aiohttp.ClientResponse | None:
+        """HTTP request wrapper using ``aiohttp`` with optional suppression.
 
-        Delegates to the shared async client in ``ji_async_http_utils.httpx``.
-        When ``resp.is_success`` is false and the status is not in
-        ``raise_on_status_except_for``, the error is recorded via
-        ``log_scrape_error`` and ``None`` is returned.
+        Delegates to ``ji_async_http_utils.aiohttp.request`` and returns the
+        live ``aiohttp.ClientResponse`` on success (2xx). On non-2xx, if the
+        status is in ``raise_on_status_except_for`` the error is recorded via
+        ``log_scrape_error`` and ``None`` is returned; otherwise the response
+        raises for status.
 
         Args:
             id: Identifier used in error logs for this request.
             url: Absolute URL to request.
+            session: The ``aiohttp.ClientSession`` to issue the request with.
             headers: Optional headers to include.
             params: Optional query parameters to include.
             raise_on_status_except_for: Status codes that should not raise.
 
         Returns:
-            The successful ``httpx.Response`` or ``None`` on failure.
+            The successful ``aiohttp.ClientResponse`` or ``None`` when suppressed.
         """
-        resp = await request(
-            url,
+        resp = await ji_async_http_utils.aiohttp.request(
+            url=url,
             headers=headers or {},
             params=params or {},
-            raise_on_status_except_for=raise_on_status_except_for,
+            session=session,
         )
-        if not resp.is_success:
-            await cls.log_scrape_error(
-                id=id,
-                url=url,
-                status=resp.status_code,
-                message=resp.text[:500],
-            )
-            return None
+        if not 200 <= resp.status <= 299:
+            if raise_on_status_except_for and resp.status in raise_on_status_except_for:
+                await cls.log_scrape_error(
+                    id=id,
+                    url=url,
+                    status=resp.status,
+                    message=(await resp.read()).decode()[:500],
+                )
+                return None
+            resp.raise_for_status()
         return resp
