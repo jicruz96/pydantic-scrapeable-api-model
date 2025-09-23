@@ -18,6 +18,7 @@ from typing import (
     TypeVar,
     get_args,
     get_type_hints,
+    overload,
 )
 from urllib.parse import urljoin, urlparse
 
@@ -135,7 +136,8 @@ class ScrapeableApiModel(CacheableModel):
                 )
             extra_params = params[1:]
             if any(
-                p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                p.kind
+                in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
                 for p in extra_params
             ):
                 raise TypeError(
@@ -244,7 +246,8 @@ class ScrapeableApiModel(CacheableModel):
             scrape_details: If ``True`` (default), also scrape the detail endpoint for
                 each item returned by ``scrape_list``.
         """
-        async with aiohttp.ClientSession() as session:
+
+        async def _run(session: aiohttp.ClientSession | None = None):
             tasks = [
                 subclass.scrape_list(
                     check_api=check_api,
@@ -260,6 +263,12 @@ class ScrapeableApiModel(CacheableModel):
             )
             if tasks:
                 await asyncio.gather(*tasks)
+
+        if check_api:
+            async with aiohttp.ClientSession() as session:
+                await _run(session)
+        else:
+            await _run()
 
     @classmethod
     async def process_list_response(
@@ -292,6 +301,54 @@ class ScrapeableApiModel(CacheableModel):
         for field, value in (await resp.json()).items():
             setattr(self, field, value)
 
+    @overload
+    @classmethod
+    async def scrape_list(
+        cls,
+        check_api: Literal[False],
+        *,
+        use_cache: bool,
+        scrape_details: bool = True,
+        session: None = None,
+        raise_on_status_except_for: Sequence[int] | None = None,
+    ) -> Sequence[Self]: ...
+
+    @overload
+    @classmethod
+    async def scrape_list(
+        cls,
+        check_api: Literal[True],
+        *,
+        use_cache: bool,
+        scrape_details: bool = True,
+        session: aiohttp.ClientSession,
+        raise_on_status_except_for: Sequence[int] | None = None,
+    ) -> Sequence[Self]: ...
+
+    @overload
+    @classmethod
+    async def scrape_list(
+        cls,
+        check_api: bool,
+        *,
+        use_cache: bool,
+        scrape_details: bool = True,
+        session: aiohttp.ClientSession | None = None,
+        raise_on_status_except_for: Sequence[int] | None = None,
+    ) -> Sequence[Self]: ...
+
+    @overload
+    @classmethod
+    async def scrape_list(
+        cls,
+        check_api: str,
+        *,
+        use_cache: bool,
+        scrape_details: bool = True,
+        session: aiohttp.ClientSession,
+        raise_on_status_except_for: Sequence[int] | None = None,
+    ) -> Sequence[Self]: ...
+
     @classmethod
     async def scrape_list(
         cls,
@@ -299,7 +356,7 @@ class ScrapeableApiModel(CacheableModel):
         *,
         use_cache: bool,
         scrape_details: bool = True,
-        session: aiohttp.ClientSession,
+        session: aiohttp.ClientSession | None = None,
         raise_on_status_except_for: Sequence[int] | None = None,
     ) -> Sequence[Self]:
         """Return model instances from the list endpoint or cache.
@@ -314,7 +371,8 @@ class ScrapeableApiModel(CacheableModel):
             use_cache: ``True`` to read/write cache; ``False`` to ignore cache.
             scrape_details: When ``True`` (default), invoke ``scrape_detail`` on each
                 model before returning.
-            session: The ``aiohttp.ClientSession`` to use for HTTP requests.
+            session: The ``aiohttp.ClientSession`` to use for HTTP requests. Must be
+                provided when ``check_api`` is ``True`` or a string override.
             raise_on_status_except_for: Status codes that should not raise.
 
         Returns:
@@ -334,6 +392,10 @@ class ScrapeableApiModel(CacheableModel):
             raise ValueError(
                 f"Cannot check API for {cls.__name__} because list_endpoint is "
                 "not set and check_api did not provide an override"
+            )
+        if not session:
+            raise ValueError(
+                "session must be provided if check_api is True or a string"
             )
         url = cls._build_url(endpoint)
         cls.logger.info("Scraping %s from %s", cls.__name__, url)
