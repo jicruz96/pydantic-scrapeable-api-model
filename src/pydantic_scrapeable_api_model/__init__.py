@@ -614,6 +614,7 @@ class ScrapeableApiModel(CacheableModel):
             headers=headers or {},
             params=params or {},
             session=session,
+            raise_for_status=False,
         )
         if not 200 <= resp.status <= 299:
             if raise_on_status_except_for and resp.status in raise_on_status_except_for:
